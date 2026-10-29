@@ -30,6 +30,12 @@ import type { Context as KoishiContext } from '@koishijs/core'
 import { WebridgeInternal } from './internal.js'
 import { WebridgeMessageEncoder } from './message.js'
 import { InboundMediaReceiver, DEFAULT_INBOUND_MEDIA_MAX_BYTES, DEFAULT_INBOUND_MEDIA_TIMEOUT } from './media.js'
+import {
+  InboundMediaRelay,
+  DEFAULT_INBOUND_MEDIA_RELAY_MAX_BYTES,
+  DEFAULT_INBOUND_MEDIA_RELAY_MAX_ITEMS,
+  DEFAULT_INBOUND_MEDIA_RELAY_TTL,
+} from './media-relay.js'
 import type { InboundMediaContent } from './media.js'
 import { DEFAULT_ATTACHMENT_MAX_BYTES, type MessageMediaKind } from './media-format.js'
 import { WebridgeCommandError, WebridgeTransportError } from './error.js'
@@ -87,6 +93,7 @@ import {
 import type { InboundMediaKind } from './protocol.js'
 import { loadOrCreateSecret } from './secret.js'
 import {
+  buildHttpUrl,
   buildWebSocketUrl,
   formatHost,
   isLoopbackHost,
@@ -278,6 +285,16 @@ export class WebridgeBot<
       .description('单张入站图片和表情最大字节数；默认 5 MiB，超限不会交给业务插件。'),
     inboundAttachmentMaxBytes: Schema.natural().min(1024).max(32 * 1024 * 1024).default(DEFAULT_ATTACHMENT_MAX_BYTES)
       .description('入站语音、视频和文件的最大字节数；默认 20 MiB，也约束语音解码后的大小。'),
+    inboundMediaRelay: Schema.boolean().default(false).description(
+      '将取件成功的入站媒体临时托管在 server 上，并把元素 src 换成带路径令牌的 http(s) 地址，便于原样转发。' +
+        '默认关闭。关闭时仍使用 data: URL，且不注册托管路由；修改开关后需要重新加载适配器。',
+    ),
+    inboundMediaRelayTtl: Schema.natural().min(1000).max(3_600_000).default(DEFAULT_INBOUND_MEDIA_RELAY_TTL)
+      .role('ms').description('托管地址有效期。到期后删除字节并返回 404。默认 5 分钟。'),
+    inboundMediaRelayMaxItems: Schema.natural().min(1).max(256).default(DEFAULT_INBOUND_MEDIA_RELAY_MAX_ITEMS)
+      .description('同时保留的托管条数。达到上限时新的媒体仍以 data: URL 投递，不删除尚未过期的条目。'),
+    inboundMediaRelayMaxBytes: Schema.natural().min(1024).max(256 * 1024 * 1024).default(DEFAULT_INBOUND_MEDIA_RELAY_MAX_BYTES)
+      .description('全部托管媒体的总字节上限。单条仍受入站图片或附件上限约束；放不下时该条保持 data: URL。'),
     quoteOnReply: Schema.boolean()
       .default(true)
       .description(
@@ -315,6 +332,10 @@ export class WebridgeBot<
     inboundMediaTimeout: DEFAULT_INBOUND_MEDIA_TIMEOUT,
     inboundMediaMaxBytes: DEFAULT_INBOUND_MEDIA_MAX_BYTES,
     inboundAttachmentMaxBytes: DEFAULT_ATTACHMENT_MAX_BYTES,
+    inboundMediaRelay: false,
+    inboundMediaRelayTtl: DEFAULT_INBOUND_MEDIA_RELAY_TTL,
+    inboundMediaRelayMaxItems: DEFAULT_INBOUND_MEDIA_RELAY_MAX_ITEMS,
+    inboundMediaRelayMaxBytes: DEFAULT_INBOUND_MEDIA_RELAY_MAX_BYTES,
     quoteOnReply: true,
   }
 
@@ -333,6 +354,8 @@ export class WebridgeBot<
   /** 当前已握手的设备连接。WeBridge 是「一台手机一个微信号」，只维护一条。 */
   private socket?: WebSocket
   private mediaReceiver?: InboundMediaReceiver
+  /** 仅在启动时开启 inboundMediaRelay 后存在；关闭开关不会注册这条路由。 */
+  private mediaRelay?: InboundMediaRelay
   private inboundQueues = new Map<string, Promise<void>>()
   private inboundQueued = 0
   private inboundGeneration = 0
@@ -545,11 +568,22 @@ export class WebridgeBot<
     // 每个 Bot 独立路由，防止相同路由前缀下的多账号互相截获上传。
     const mediaPath = `${this.routePath}/media/upload/${randomUUID()}`
     this.mediaReceiver = new InboundMediaReceiver(this, mediaPath, (token) => {
-      const url = new URL(buildWebSocketUrl(this.callbackBaseUrl(), `${mediaPath}/${token}`))
-      url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:'
-      return url.toString()
+      return buildHttpUrl(this.callbackBaseUrl(), `${mediaPath}/${token}`)
     })
     this.mediaReceiver.start()
+    if (this.config.inboundMediaRelay) {
+      const relayPath = `${this.routePath}/media/relay/${randomUUID()}`
+      this.mediaRelay = new InboundMediaRelay(this, relayPath, (token) => {
+        return buildHttpUrl(this.callbackBaseUrl(), `${relayPath}/${token}`)
+      })
+      this.mediaRelay.start()
+      this.logger.info(
+        '入站媒体托管已开启 ttl=%dms maxItems=%d maxBytes=%d',
+        this.config.inboundMediaRelayTtl ?? DEFAULT_INBOUND_MEDIA_RELAY_TTL,
+        this.config.inboundMediaRelayMaxItems ?? DEFAULT_INBOUND_MEDIA_RELAY_MAX_ITEMS,
+        this.config.inboundMediaRelayMaxBytes ?? DEFAULT_INBOUND_MEDIA_RELAY_MAX_BYTES,
+      )
+    }
 
     // 对外只打印一条完整地址：path 与 secret 不再分开显示，用户直接复制这一行。
     // 路由注册信息只留在 debug 里，而且只打 path，避免和完整地址重复。
@@ -576,6 +610,8 @@ export class WebridgeBot<
     this.cancelInbound()
     this.mediaReceiver?.stop()
     this.mediaReceiver = undefined
+    this.mediaRelay?.stop()
+    this.mediaRelay = undefined
     for (const timer of this.handshakeTimers.values()) clearTimeout(timer)
     this.handshakeTimers.clear()
     // WebSocketLayer.close() 会把自己从 wsStack 摘掉并关掉所有 socket ——
@@ -886,6 +922,13 @@ export class WebridgeBot<
           contents[index] = this.mediaReceiver
             ? await this.mediaReceiver.receive(typeof frame.body.message_id === 'string' ? frame.body.message_id : '', kind as MessageMediaKind)
             : { kind, status: 'unavailable', reason: 'disconnected' }
+          if (contents[index].status === 'ready' && this.mediaRelay) {
+            const hosted = this.mediaRelay.publish(contents[index])
+            if (hosted.src) contents[index].src = hosted.src
+            else if (hosted.reason && hosted.reason !== 'disabled') {
+              logger.warn('入站媒体未托管 kind=%s reason=%s', kind, hosted.reason)
+            }
+          }
         }
         if (contents[index].status !== 'ready' && retrievable.includes(kind)) {
           logger.warn('入站媒体内容不可用 kind=%s reason=%s', kind, contents[index].reason)
@@ -1632,6 +1675,11 @@ export namespace WebridgeBot {
     inboundMediaTimeout?: number
     inboundMediaMaxBytes?: number
     inboundAttachmentMaxBytes?: number
+    /** 启动时为 true 才注册托管路由。 */
+    inboundMediaRelay?: boolean
+    inboundMediaRelayTtl?: number
+    inboundMediaRelayMaxItems?: number
+    inboundMediaRelayMaxBytes?: number
     quoteOnReply?: boolean
     echoTimeout?: number
   }

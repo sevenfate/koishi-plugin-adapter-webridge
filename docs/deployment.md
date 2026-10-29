@@ -2,7 +2,7 @@
 
 [返回首页](../readme.md)
 
-WeBridge 主动连接 Koishi。手机需要访问两类入口：WebSocket 连接用于事件和命令，HTTP POST 用于入站媒体上传。
+WeBridge 主动连接 Koishi。手机需要访问两类入口：WebSocket 连接用于事件和命令，HTTP POST 用于入站媒体上传。开启入站媒体托管后，手机还会对托管地址发起 HTTP GET。
 
 ## 局域网
 
@@ -58,8 +58,9 @@ location ^~ /webridge/ {
 | --- | --- |
 | `/webridge/连接密钥` | WebSocket 握手与持续连接 |
 | `/webridge/media/upload/…` | 一次性媒体上传，使用独立令牌 |
+| `/webridge/media/relay/…` | 开启 `inboundMediaRelay` 后的短期下载。路径令牌即凭证，使用 GET；不要在访问日志里保留完整路径 |
 
-只代理完整 WebSocket 地址，会导致文本正常但媒体上传失败。使用自定义路径时，应将整个对应前缀交给 Koishi，保留上传请求的正文和 HTTP 方法。
+只代理完整 WebSocket 地址，会导致文本正常但媒体上传失败；开启托管时，手机的 GET 下载也会失败。使用自定义路径时，应将整个对应前缀交给 Koishi，保留上传请求的正文和 HTTP 方法。
 
 连接地址的最后一段作为密钥，前面的路径是路由前缀。例如 `/bots/webridge/密钥` 的路由前缀为 `/bots/webridge`。自定义前缀时同步修改 Nginx 的 `location`，不要自行添加 `/agent`、查询串或锚点，也不要在代理层额外剥掉前缀。
 

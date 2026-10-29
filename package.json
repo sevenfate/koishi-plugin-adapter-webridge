@@ -74,7 +74,7 @@
     "build:js": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=lib/index.mjs --external:koishi --external:@koishijs/core --external:@satorijs/core --external:@satorijs/element --external:@cordisjs/plugin-server --external:schemastery --external:silk-wasm && esbuild src/index.ts --bundle --platform=node --format=cjs --outfile=lib/index.cjs --external:koishi --external:@koishijs/core --external:@satorijs/core --external:@satorijs/element --external:@cordisjs/plugin-server --external:schemastery --external:silk-wasm",
     "build:dts": "tsc -p tsconfig.json && node -e \"require('node:fs').copyFileSync('lib/index.d.ts','lib/index.d.cts')\"",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.check.json",
-    "test": "tsx tests/protocol.spec.ts && tsx tests/reliability.spec.ts && tsx tests/e2e.spec.ts && tsx tests/media.spec.ts && tsx tests/native.spec.ts && tsx --test tests/directory.spec.ts tests/archive.spec.ts tests/integration.spec.ts",
+    "test": "tsx tests/protocol.spec.ts && tsx tests/reliability.spec.ts && tsx tests/e2e.spec.ts && tsx tests/media.spec.ts && tsx tests/relay.spec.ts && tsx tests/native.spec.ts && tsx --test tests/directory.spec.ts tests/archive.spec.ts tests/integration.spec.ts",
     "test:all": "npm run typecheck && npm test",
     "prepack": "npm run build"
   },

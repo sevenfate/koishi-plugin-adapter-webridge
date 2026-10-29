@@ -50,6 +50,7 @@ import { MEDIA_COMMANDS } from '../src/message'
 import * as protocol from '../src/protocol'
 import { generateSecret, loadOrCreateSecret } from '../src/secret'
 import {
+  buildHttpUrl,
   buildWebSocketUrl,
   formatHost,
   isLoopbackHost,
@@ -605,6 +606,23 @@ test('parseCallbackAddress：拒绝非法协议 / secret', () => {
 
 test('buildWebSocketUrl：拒绝非 http/ws 协议', () => {
   assert.throws(() => buildWebSocketUrl('ftp://example.com', '/x'), /基地址/)
+})
+
+test('buildHttpUrl：ws(s) 基地址换成手机可下载的 http(s)', () => {
+  assert.equal(
+    buildHttpUrl('ws://192.168.1.4:5140', '/webridge/media/relay/id/token'),
+    'http://192.168.1.4:5140/webridge/media/relay/id/token',
+  )
+  assert.equal(
+    buildHttpUrl('wss://bot.example.com/koishi/', '/webridge/media/relay/id/token'),
+    'https://bot.example.com/koishi/webridge/media/relay/id/token',
+    '反向代理子路径要保留，供手机下载托管媒体',
+  )
+  assert.equal(
+    buildHttpUrl('https://bot.example.com:443/koishi?token=1#x', '/webridge/media/relay/id/abc'),
+    'https://bot.example.com/koishi/webridge/media/relay/id/abc',
+    '查询串和锚点不能进入托管地址',
+  )
 })
 
 test('formatHost：IPv6 加方括号，IPv4 / 主机名保持原样', () => {

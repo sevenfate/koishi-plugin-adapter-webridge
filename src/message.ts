@@ -41,10 +41,10 @@ export const MEDIA_COMMANDS: Record<string, { command: string; arg: string; labe
 const CHANNEL_TYPE_TEXT = 0
 
 /** 媒体 URL 必须是 http(s) —— 别的交给设备去下载只会得到一句没用的报错。 */
-const MEDIA_URL = /^https?:\/\/\S+$/i
+export const MEDIA_URL = /^https?:\/\/\S+$/i
 
 /** URL 上限，超过就丢弃而不是截断（截断出来的是坏地址）。 */
-const MAX_MEDIA_URL_LENGTH = 2048
+export const MAX_MEDIA_URL_LENGTH = 2048
 
 /**
  * 编码器要对 `Context` 泛型 —— 这样才和 `Bot` 基类上
@@ -111,6 +111,7 @@ export class WebridgeMessageEncoder<C extends Context = Context> extends Message
           // 设备会自己去下载这个地址，给个本地路径、`data:` URL 或乱码只会得到一句
           // 没用的报错。入站媒体占位（不带 src 的 `<img/>`）也会走到这里，
           // 转发这类消息时正文照发、媒体跳过，是预期行为。
+          // 需要原样转发时打开 inboundMediaRelay：收件阶段会把 data: 换成 http(s)，这里不再改写。
           this.skipped.add(`${type}(需要 http(s) 的 src)`)
           return
         }

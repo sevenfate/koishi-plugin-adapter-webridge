@@ -129,3 +129,14 @@ export function buildWebSocketUrl(baseUrl: string, endpoint: string): string {
   }
   return url.toString()
 }
+
+/**
+ * 用与 {@link buildWebSocketUrl} 相同的基地址规则，拼出手机能下载的 http(s) 地址。
+ *
+ * `ws:` 换成 `http:`，`wss:` 换成 `https:`。查询串和锚点同样会被清掉。
+ */
+export function buildHttpUrl(baseUrl: string, endpoint: string): string {
+  const url = new URL(buildWebSocketUrl(baseUrl, endpoint))
+  url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:'
+  return url.toString()
+}
