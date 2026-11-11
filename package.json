@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-adapter-webridge",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "WeBridge 个人微信适配器：手机上的 WeBridge 插件作为 WebSocket 客户端连入 Koishi",
   "type": "module",
   "main": "lib/index.cjs",

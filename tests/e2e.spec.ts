@@ -85,6 +85,30 @@ function messageEvent(over: Record<string, any> = {}) {
   }
 }
 
+/**
+ * 拼一个「body 没有会话字段」的平台事件帧。
+ *
+ * 转账退还结果（协议 v8.0.80 23.5）不是聊天消息，body 里没有 chat_id / room_id /
+ * sender_id，所以不复用 messageEvent 的消息字段，单独拼一个最小帧。
+ */
+function platformEvent(eventName: string, body: Record<string, any>, over: Record<string, any> = {}) {
+  return {
+    type: 'event',
+    device_id: DEVICE_ID,
+    session_id: SESSION_ID,
+    account_id: BOT_WXID,
+    runtime_version: '8.0.80',
+    build_marker: 'webridge_build_20261109',
+    ts_ms: nowMs(),
+    event_name: eventName,
+    event_id: eventName + ':1',
+    captured_at_ms: nowMs(),
+    enqueued_at_ms: nowMs(),
+    body,
+    ...over,
+  }
+}
+
 /** 模拟手机上的 WeBridge 插件。 */
 class FakePlugin {
   private queue: any[] = []
@@ -913,7 +937,9 @@ async function main() {
       const invite = bot.internal.inviteGuildMember('111@chatroom', 'wxid_new')
       const inviteCmd = await plugin.expectCommand()
       assert.equal(inviteCmd.command_name, 'invite_group_member')
-      assert.equal(inviteCmd.args.wxid, 'wxid_new')
+      // 协议 v8.0.80 第 16 节统一用 member_ids 数组，单个成员也包一层；不再发旧的 wxid 键
+      assert.deepEqual(inviteCmd.args.member_ids, ['wxid_new'])
+      assert.equal(inviteCmd.args.room_id, '111@chatroom')
       plugin.reply(inviteCmd)
       await invite
 
@@ -1023,6 +1049,152 @@ async function main() {
       plugin.reply(lateCmd)
       assert.deepEqual(await late, [], '没有回推时不该编造 message_id')
       console.log('PASS 自发回推 → message_id → 撤回')
+    }
+
+    // --- 21. 8.0.80 新增：收款 confirmed 判据、转账退还/查询与群操作 ---
+    {
+      // 收款成功判据只有 confirmed=true（status=callback_ok 是典型成功形态）
+      const receiving = bot.internal.receiveTransfer('transfer_1', 'msg_transfer_1')
+      const receiveCmd = await plugin.expectCommand()
+      assert.equal(receiveCmd.command_name, 'receive_transfer')
+      assert.deepEqual(receiveCmd.args, { transfer_id: 'transfer_1', message_id: 'msg_transfer_1' })
+      plugin.reply(receiveCmd, true, '', {
+        status: 'callback_ok',
+        confirmed: true,
+        accepted: true,
+        callback_received: true,
+        ret_code: 0,
+      })
+      const received = await receiving
+      assert.equal(received.ok, true)
+      assert.equal(received.confirmed, true, 'confirmed=true 才算确认收款')
+      assert.equal(received.status, 'callback_ok')
+      assert.equal(received.ret_code, 0)
+      assert.equal(received.error, '')
+
+      // confirm_invoked 只是「已发起但等待超时」，confirmed=false：不能抛错、不能认定到账
+      const waiting = bot.internal.receiveTransfer(undefined, 'msg_transfer_2')
+      const waitingCmd = await plugin.expectCommand()
+      assert.equal(waitingCmd.command_name, 'receive_transfer')
+      assert.deepEqual(waitingCmd.args, { message_id: 'msg_transfer_2' }, '未提供的 transfer_id 不应下发空串')
+      plugin.reply(waitingCmd, true, '', {
+        status: 'confirm_invoked',
+        accepted: true,
+        confirmed: false,
+        callback_received: false,
+        ret_code: null,
+      })
+      const waitingOutcome = await waiting
+      assert.equal(waitingOutcome.ok, true, '业务未决不等于命令失败')
+      assert.equal(waitingOutcome.confirmed, false, 'confirm_invoked 不能当确认收款')
+      assert.equal(waitingOutcome.status, 'confirm_invoked')
+
+      // 建群：command_name / args.member_ids / 信封 request_id；回 created 后 room_id 正确
+      const creating = bot.internal.createGroup(['wxid_a', 'wxid_b'])
+      const createCmd = await plugin.expectCommand()
+      assert.equal(createCmd.command_name, 'create_group')
+      assert.deepEqual(createCmd.args.member_ids, ['wxid_a', 'wxid_b'])
+      assert.ok(createCmd.request_id, 'create_group 的命令信封必须带 request_id')
+      plugin.reply(createCmd, true, '', {
+        status: 'created',
+        mode: 'create',
+        request_id: 'create-business-1',
+        room_id: '99887766@chatroom',
+        member_ids: ['wxid_a', 'wxid_b'],
+        created: true,
+        all_members_added: true,
+      })
+      const created = await creating
+      assert.equal(created.ok, true)
+      assert.equal(created.status, 'created')
+      assert.equal(created.room_id, '99887766@chatroom')
+      assert.equal(created.created, true)
+
+      // 显式 requestId 原样进信封（同 ID 只用于查询/重放，换 ID 不等于安全重试）
+      const replaying = bot.internal.createGroup('wxid_a', { requestId: 'create-replay-1' })
+      const replayCmd = await plugin.expectCommand()
+      assert.equal(replayCmd.command_name, 'create_group')
+      assert.equal(replayCmd.request_id, 'create-replay-1', '显式 requestId 应原样出现在命令信封')
+      assert.deepEqual(replayCmd.args.member_ids, ['wxid_a'], '单个成员也要包成数组')
+      plugin.reply(replayCmd, true, '', { status: 'created', room_id: '99887766@chatroom' })
+      assert.equal((await replaying).status, 'created')
+
+      // 直接加人：ok=false + requires_invitation 也要保留结构化 result，不能抛错
+      const adding = bot.internal.addGroupMember(GROUP_ID, ['wxid_a', 'wxid_b'])
+      const addCmd = await plugin.expectCommand()
+      assert.equal(addCmd.command_name, 'add_group_member')
+      assert.equal(addCmd.args.room_id, GROUP_ID)
+      assert.deepEqual(addCmd.args.member_ids, ['wxid_a', 'wxid_b'])
+      plugin.reply(addCmd, false, 'MEMBERS_NOT_ALL_ADDED', {
+        status: 'requires_invitation',
+        error_code: 'MEMBERS_NOT_ALL_ADDED',
+        invite_required_member_ids: ['wxid_a'],
+      })
+      const added = await adding
+      assert.equal(added.ok, false)
+      assert.equal(added.error, 'MEMBERS_NOT_ALL_ADDED')
+      assert.equal(added.status, 'requires_invitation')
+      assert.deepEqual(added.invite_required_member_ids, ['wxid_a'], '需要单独邀请的成员名单必须保留')
+
+      // 退还：只有 status=refunded + native_status=2002 才是已退还
+      const refunding = bot.internal.refundTransfer('transfer_2')
+      const refundCmd = await plugin.expectCommand()
+      assert.equal(refundCmd.command_name, 'refund_transfer')
+      assert.deepEqual(refundCmd.args, { transfer_id: 'transfer_2' })
+      plugin.reply(refundCmd, true, '', {
+        status: 'refunded',
+        native_status: 2002,
+        accepted: true,
+        confirmed: true,
+      })
+      const refunded = await refunding
+      assert.equal(refunded.ok, true)
+      assert.equal(refunded.status, 'refunded')
+      assert.equal(refunded.native_status, 2002)
+
+      // 查询：waiting_receive 字段原样透传，can_refund 只表示可退还，不代表已退
+      const querying = bot.internal.getTransferStatus(undefined, 'msg_transfer_3')
+      const queryCmd = await plugin.expectCommand()
+      assert.equal(queryCmd.command_name, 'get_transfer_status')
+      assert.deepEqual(queryCmd.args, { message_id: 'msg_transfer_3' })
+      plugin.reply(queryCmd, true, '', {
+        transfer_id: 'transfer_3',
+        status: 'waiting_receive',
+        native_status: 1,
+        can_refund: true,
+      })
+      const queried = await querying
+      assert.equal(queried.ok, true)
+      assert.equal(queried.status, 'waiting_receive')
+      assert.equal(queried.can_refund, true)
+      assert.equal(plugin.pendingCount, 0, '本段命令都应被消费')
+      console.log('PASS 8.0.80 收款 confirmed 判据、转账退还/查询与群操作')
+    }
+
+    // --- 22. transfer_refund_result 只走自定义事件，不进消息流 ---
+    {
+      const refundEvents: any[] = []
+      const off = app.on('webridge/transfer-refund-result', (payload) => { refundEvents.push(payload) })
+      // event_id 用完整形态 transfer_refund:<refund_result_id>，去重不能按 transfer_id
+      plugin.send(platformEvent('transfer_refund_result', {
+        refund_result_id: 'refund_result_example',
+        transfer_id: 'transfer_2',
+        status: 'refunded',
+        native_status: 2002,
+        confirmed: true,
+        accepted: true,
+        ret_code: 0,
+      }, { event_id: 'transfer_refund:refund_result_example' }))
+      await sleep(300)
+      off()
+      assert.equal(refundEvents.length, 1, '应收到 webridge/transfer-refund-result 事件')
+      const payload = refundEvents[0]
+      assert.equal(payload.eventName, 'transfer_refund_result')
+      assert.equal(payload.kind, 'transfer-refund')
+      assert.equal(payload.eventId, 'transfer_refund:refund_result_example')
+      assert.equal(payload.body.status, 'refunded')
+      assert.equal(payload.body.native_status, 2002)
+      console.log('PASS transfer_refund_result 走自定义事件并保留原始字段')
     }
 
     {

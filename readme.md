@@ -2,7 +2,7 @@
 
 连接 **WeBridge** 与 **Koishi**，让 Koishi 插件处理微信消息。
 
-支持文本和媒体收发、引用、@、群与联系人查询、群成员昵称补齐，以及可选的聊天归档。
+支持文本和媒体收发、引用、@、群与联系人查询、群成员昵称补齐、群操作与转账退还/状态查询，以及可选的聊天归档。
 
 ```text
 WeBridge ── WebSocket ──▶ Koishi 适配器 ──▶ 业务插件
@@ -34,7 +34,7 @@ npm install koishi-plugin-adapter-webridge
 也可以从 [GitHub Releases](https://github.com/sevenfate/koishi-plugin-adapter-webridge/releases) 下载安装包，再在 Koishi 应用目录执行：
 
 ```bash
-npm install /path/to/koishi-plugin-adapter-webridge-1.0.0.tgz
+npm install /path/to/koishi-plugin-adapter-webridge-2.0.0.tgz
 ```
 
 用 Yarn 管理的应用请使用对应的 `yarn add`，不要混用包管理器。
@@ -90,8 +90,8 @@ echo 接入测试
 | 接收消息 | 文本、引用、@、@所有人；图片、表情、语音、视频和文件取件成功后生成标准 Koishi 元素 |
 | 发送消息 | 文本、@、引用，以及使用 HTTP(S) URL 的图片、语音、视频和文件 |
 | 通讯录 | 查询群、成员与好友；群消息按需补齐群名和成员昵称，无需数据库 |
-| 通知事件 | 群成员加入、离开、改名及好友申请映射为标准事件，其他平台事件通过扩展事件提供 |
-| 管理接口 | 撤回、群管理，以及 `bot.internal` 提供的平台原生能力 |
+| 通知事件 | 群成员加入、离开、改名及好友申请映射为标准事件；红包、转账、转账退还结果等通过扩展事件提供 |
+| 管理接口 | 撤回、群管理（含建群与直接加人）、转账退还与状态查询，以及 `bot.internal` 提供的平台原生能力 |
 | 聊天归档 | 默认关闭；开启后保存消息、群资料和成员变动，需要数据库 |
 
 ## 使用边界
@@ -102,6 +102,22 @@ echo 接入测试
 - 昵称通过群目录补齐；查询失败、资料缺失或等待超时时仍会继续处理消息，可能回退显示账号 ID。
 - 名片、链接、小程序、合并转发等入站内容保留类型说明；并非所有消息段都支持原样发送。
 - 设备命令回执不等于微信端最终展示成功。群管理、引用和撤回也受当前账号权限及设备缓存限制。
+- 本版本依据 WeBridge 8.0.80 的 **WebSocket** 协议说明。升级手机插件前先确认命令名、参数与返回字段仍然一致；文档称业务接口沿用 8079，不代表可以混用 HTTP／长轮询信封。
+- 确认收款必须看 `confirmed`：只有 `ok=true` 且业务结果 `confirmed=true`（或独立查询到原生状态 2001）才算到账；`status=confirm_invoked` 是已发起但等待超时，需先用 `getTransferStatus()` 查询，不能直接重试。
+- 建群、加人、邀请以业务 `status`（及 `member_results`、`invite_required_member_ids`）判断结果；结果未知时用**相同 request_id** 查询或重放，换 ID 不等于安全重试。
+- `mark_session_read`（标记已读）已从 8.0.80 移除，适配器不再提供 `markSessionRead()`，下发只会得到 `unsupported command_name`。
+
+## 从 1.x 升级到 2.0
+
+本版按 WeBridge 8.0.80 协议适配，使用下列原生接口的业务插件需要同步修改：
+
+| 接口 | 升级要求 |
+| --- | --- |
+| `internal.receiveTransfer()` | 返回合并后的业务结果，业务失败不再抛异常；检查 `ok` 与 `confirmed`，结果未决时先查询状态。 |
+| `internal.inviteGuildMember()` | 返回 `GroupOperationOutcome`；检查 `ok` 与 `status`，不能仅凭调用未抛错判断成功。 |
+| `internal.markSessionRead()` | 已移除；删除调用，手机协议不再支持该命令。 |
+
+普通文本、媒体收发和标准通讯录接口的调用方式不变。完整说明见 [更新日志](CHANGELOG.md) 与 [插件开发](docs/development.md)。
 
 ## 继续阅读
 

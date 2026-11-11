@@ -3,7 +3,7 @@
  *
  * 这一层**不做任何 IO**，全部是纯函数，方便直接单测。
  *
- * 协议来源：WeBridge 插件作者提供的《服务端 WebSocket 协议说明》（v0.8.79）。
+ * 协议来源：WeBridge 插件作者提供的《服务端 WebSocket 协议说明》（v8.0.80）。
  */
 
 import type { CommandFrame, EventBody, EventFrame, HelloAckFrame } from './types.js'
@@ -71,6 +71,18 @@ export const EVENT_RED_PACKET = 'red_packet_received'
 export const EVENT_TRANSFER = 'transfer_received'
 
 /**
+ * 转账退还结果事件（协议 v8.0.80 23.5 末尾）。
+ *
+ * `event_id` 形如 `transfer_refund:<refund_result_id>`，去重必须用完整 `event_id`，
+ * **不能按 `transfer_id` 去重** —— 同笔转账的查询或后续结果会被吞掉。
+ *
+ * 事件名**不代表退还成功**：只有 `native_status=2002` 且 `status='refunded'`
+ * 才确认已退还。事件只在退还提交且操作结束时才可能产生，未收到事件不代表没退还，
+ * 所以必须保留 `get_transfer_status` 主动查询路径。
+ */
+export const EVENT_TRANSFER_REFUND_RESULT = 'transfer_refund_result'
+
+/**
  * 好友申请。协议 15.7 明确说**这个事件的 body 结构有明显不确定性**
  * （`event_id` 有三种生成形态，body 字段"至少包含其中一部分"）。
  * 同意申请前必须校验 `encrypt_username` 和 `ticket` 是否都存在。
@@ -91,6 +103,7 @@ export const KNOWN_EVENTS = new Set([
   EVENT_MOMENTS_RESULT,
   EVENT_RED_PACKET,
   EVENT_TRANSFER,
+  EVENT_TRANSFER_REFUND_RESULT,
   EVENT_GROUP_MEMBER_JOIN,
   EVENT_GROUP_MEMBER_LEAVE,
   EVENT_GROUP_MEMBER_NICKNAME,
@@ -101,6 +114,7 @@ export const NON_MESSAGE_EVENTS = new Set([
   EVENT_MOMENTS_RESULT,
   EVENT_RED_PACKET,
   EVENT_TRANSFER,
+  EVENT_TRANSFER_REFUND_RESULT,
   EVENT_GROUP_MEMBER_JOIN,
   EVENT_GROUP_MEMBER_LEAVE,
   EVENT_GROUP_MEMBER_NICKNAME,
@@ -365,6 +379,22 @@ export const CMD_INVITE_GROUP_MEMBER = 'invite_group_member'
 export const CMD_QUIT_GROUP = 'quit_group'
 
 /**
+ * 创建普通群聊（协议 v8.0.80 第 16 节）。
+ *
+ * 命令信封的 `request_id` 必填：同 ID 只用于查询／重放原业务，**换 ID 重发不等于安全重试**。
+ * 成员 ID 由设备再去重、排除本人并排序，去重后至少 2 位其他好友。
+ */
+export const CMD_CREATE_GROUP = 'create_group'
+
+/**
+ * 直接添加群成员（协议 v8.0.80 第 16 节）。
+ *
+ * 能否直接加入由微信服务端和群设置决定，插件**不会**把添加失败自动转成发送邀请；
+ * 原生方法返回成功也不代表成员已经入群，必须看业务 status。
+ */
+export const CMD_ADD_GROUP_MEMBER = 'add_group_member'
+
+/**
  * 改**我在本群的群昵称**。
  *
  * ⚠️ 别和 `set_group_name` 搞混：协议文档 14.2 里 `rename_group` /
@@ -381,7 +411,6 @@ export const CMD_DELETE_FRIEND = 'delete_friend'
 export const CMD_ACCOUNT_STATUS = 'account_status'
 export const CMD_DEVICE_STATUS = 'device_status'
 export const CMD_BRIDGE_STATUS = 'bridge_status'
-export const CMD_MARK_SESSION_READ = 'mark_session_read'
 export const CMD_DELETE_SESSION = 'delete_session'
 
 // ---- 消息发送（本地路径入口 / 卡片 / 原始 XML / 拍一拍）----
@@ -420,10 +449,23 @@ export const CMD_RED_PACKET_DETAIL = 'red_packet_detail'
 /**
  * 确认收款。
  *
- * ⚠️ 成功判据（协议 14.2）：`ok == true` **且** `result.status == "confirm_invoked"`。
- * **不要把 `callback_received == true` 当唯一判据**。
+ * ⚠️ 成功判据（协议 v8.0.80 14.6）：只有 `ok == true` **且** `result.confirmed == true`
+ * 才算确认收款。`status == "confirm_invoked"` 表示已发起收款但等待超时
+ * （`confirmed=false`），**不能认定到账**；`callback_received` 只是辅助信号，
+ * 失败时同样要读 `result`。结果未知时先查 `get_transfer_status`，不要直接重试。
  */
 export const CMD_RECEIVE_TRANSFER = 'receive_transfer'
+
+/**
+ * 退还待收取转账（协议 v8.0.80 14.6）。
+ *
+ * 只有 `status == 'refunded'` 且 `native_status == 2002` 才代表已退还；
+ * `refund_pending` / `refund_unknown` 都不能重提，先查状态。
+ */
+export const CMD_REFUND_TRANSFER = 'refund_transfer'
+
+/** 只查询转账资金状态，不执行收款或退还（协议 v8.0.80 14.6）。 */
+export const CMD_GET_TRANSFER_STATUS = 'get_transfer_status'
 
 // ---- 资料管理 ----
 export const CMD_CLEAR_GENDER_REGION = 'clear_gender_region'
@@ -434,6 +476,36 @@ export const CMD_PROFILE_REGION = 'profile_region'
 export const CMD_PROFILE_SIGNATURE = 'profile_signature'
 export const CMD_PROFILE_PAT_SUFFIX = 'profile_pat_suffix'
 export const CMD_PROFILE_REGION_CODES = 'profile_region_codes'
+
+// ---------------------------------------------------------------------------
+// 能力清单缺口（协议 v8.0.80 第 13 节）
+// ---------------------------------------------------------------------------
+
+/**
+ * 分发器**可执行**、但没有出现在 `hello.capabilities` 里的命令。
+ *
+ * 协议 v8.0.80 第 13 节明确列出这份缺口：`favorites_list` / `favorites_send` /
+ * `favorites_delete` / `set_friend_star` / `set_friend_blacklist` 是可以执行的业务命令，
+ * 另有 8 个兼容别名未声明。**清单缺省不等于不支持** —— 只按 capabilities 过滤会误判。
+ *
+ * 这里只记录缺口；调用后仍须按各命令自己的参数与返回判断业务结果。
+ */
+export const UNDECLARED_COMMANDS = new Set([
+  'favorites_list',
+  'favorites_send',
+  'favorites_delete',
+  'set_friend_star',
+  'set_friend_blacklist',
+  // 兼容别名，与主命令共用参数和结果（协议 v8.0.80 附录）
+  'group_invite_member',
+  'group_invite_member_probe',
+  'set_group_nickname',
+  'set_group_self_nickname',
+  'set_group_nickname_probe',
+  'set_group_self_nickname_probe',
+  'update_nickname',
+  'update_nickname_probe',
+])
 
 // ---------------------------------------------------------------------------
 // @ 相关常量
@@ -453,7 +525,7 @@ export const MENTION_ALL = 'notify@all'
 export const MENTION_ALL_TEXT = '@所有人'
 
 /** 服务端版本号，回在 `hello_ack` 里，插件会记进日志。与 package.json 的 version 保持一致。 */
-export const SERVER_VERSION = '1.0.0'
+export const SERVER_VERSION = '2.0.0'
 
 /**
  * 等 `command_result` 的默认超时（毫秒）。
@@ -560,6 +632,8 @@ export function isTextMessageEvent(frame: EventFrame): boolean {
  *
  * 协议规定事件**会重复**（连接抖动、重连补发都会导致同一事件推两次），必须去重。
  * 正常情况下用 `event_id`；但协议明确说它**可能整个字段缺失**，所以要有兜底组合键。
+ * `transfer_refund_result` 的 `event_id` 由 `refund_result_id` 拼成，缺 `event_id`
+ * 时用 `refund_result_id` 兜底（协议 v8.0.80 23.5）。
  *
  * 注意 `event_id` 是不透明的，**不要解析它的格式**，整体当键即可。
  */
@@ -572,6 +646,7 @@ export function dedupKey(frame: EventFrame): string {
     body.message_id,
     body.room_id,
     body.member_id,
+    body.refund_result_id,
     ...(frame?.event_name === EVENT_MOMENTS_RESULT ? [frame.account_id, body.operation_id, body.revision] : []),
   ].join('|')
 }
@@ -860,8 +935,10 @@ export function groupMemberRoomId(frame: EventFrame): string | undefined {
 /**
  * 帧的分类 —— 决定它该派发成什么事件。
  *
- * 取值对应协议 15.1 的七种事件，外加两类兜底：
+ * 取值对应协议 v8.0.80 23.1 的九种事件（message、三个群成员变更、红包、转账、
+ * 转账退还结果、好友申请、朋友圈结果），另加兜底：
  * - `system-message`：`message` 事件但 `msg_type === 'system'`（撤回、群名修改）；
+ * - `unknown-message`：`message` 事件但 `msg_type` 是 `unknown` 或认不出的新类型；
  * - `unknown`：不在协议清单里的 `event_name`（插件版本比我们新）。
  *
  * **兜底不是可选的**：协议没有承诺事件清单是闭合的，静默丢弃会让升级后
@@ -874,6 +951,7 @@ export type FrameKind =
   | 'group-member'
   | 'red-packet'
   | 'transfer'
+  | 'transfer-refund'
   | 'friend-request'
   | 'moments-result'
   | 'unknown'
@@ -892,6 +970,7 @@ export function frameKind(frame: EventFrame): FrameKind {
   if (GROUP_MEMBER_EVENT_MAP[name]) return 'group-member'
   if (name === EVENT_RED_PACKET) return 'red-packet'
   if (name === EVENT_TRANSFER) return 'transfer'
+  if (name === EVENT_TRANSFER_REFUND_RESULT) return 'transfer-refund'
   if (name === EVENT_FRIEND_REQUEST) return 'friend-request'
   if (name === EVENT_MOMENTS_RESULT) return 'moments-result'
   return 'unknown'

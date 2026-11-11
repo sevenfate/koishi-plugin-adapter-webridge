@@ -21,18 +21,20 @@
  * `sendCommand` / `query` —— 那才是"怎么跟设备说话"的机制层。
  */
 
-import { WebridgeNativeApi } from './native.js'
+import { GROUP_OPERATION_TIMEOUT, TRANSFER_OPERATION_TIMEOUT, WebridgeNativeApi } from './native.js'
 import {
   CMD_ACCEPT_FRIEND_REQUEST,
   CMD_ACCOUNT_STATUS,
+  CMD_ADD_GROUP_MEMBER,
   CMD_BRIDGE_STATUS,
   CMD_CLEAR_GENDER_REGION,
+  CMD_CREATE_GROUP,
   CMD_DELETE_SESSION,
   CMD_DEVICE_STATUS,
   CMD_FORWARD_MESSAGE,
   CMD_GET_GROUP_NOTICE,
+  CMD_GET_TRANSFER_STATUS,
   CMD_INVITE_GROUP_MEMBER,
-  CMD_MARK_SESSION_READ,
   CMD_PROFILE_GENDER,
   CMD_PROFILE_NICKNAME,
   CMD_PROFILE_PAT_SUFFIX,
@@ -44,6 +46,7 @@ import {
   CMD_RECEIVE_RED_PACKET,
   CMD_RECEIVE_TRANSFER,
   CMD_RED_PACKET_DETAIL,
+  CMD_REFUND_TRANSFER,
   CMD_RENAME_GROUP,
   CMD_SEND_FILE,
   CMD_SEND_IMAGE,
@@ -57,9 +60,43 @@ import {
   CMD_SET_GROUP_NAME,
 } from './protocol.js'
 import type { InboundMediaContent } from './media.js'
-import type { AccountStatusResult, DeviceStatusResult, GroupNoticeResult, RoomMembersResult } from './types.js'
+import type {
+  AccountStatusResult,
+  CommandResultFrame,
+  DeviceStatusResult,
+  GroupNoticeResult,
+  GroupOperationOutcome,
+  RoomMembersResult,
+  TransferOutcome,
+} from './types.js'
 
 export class WebridgeInternal extends WebridgeNativeApi {
+
+  // ------------------------------------------------------------------
+  // 业务结果合并（协议 v8.0.80：失败也要保留 result）
+  // ------------------------------------------------------------------
+
+  /**
+   * 下发命令，并把**命令信封**的 `ok`／`error` 合并进业务 `result`。
+   *
+   * 为什么新接口不用 `bot.query()`：它会把 `ok=false` 直接翻成异常，失败时
+   * `result` 里的业务状态（`confirmed`、`status`、`member_results`、
+   * `invite_required_member_ids` 等）就丢了。群操作与转账的失败本身带业务语义，
+   * 调用方必须能读到。
+   *
+   * 合并顺序按「信封优先」：`result` 里的同名字段不覆盖外层 `ok`／`error`。
+   * 协议 v8.0.80 保证 `result` 内不再重复这两个字段，这里仍以信封为准。
+   */
+  private async outcome<T extends Record<string, unknown>>(
+    command: string,
+    args: Record<string, unknown>,
+    timeout: number,
+    requestId?: string,
+  ): Promise<T & { ok: boolean; error: string }> {
+    const frame: CommandResultFrame = await this.bot.sendCommand(command, args, timeout, requestId)
+    const result = frame.result && typeof frame.result === 'object' && !Array.isArray(frame.result) ? frame.result : {}
+    return { ...result, ok: frame.ok, error: frame.error ?? '' } as T & { ok: boolean; error: string }
+  }
 
   /** 完整目录快照，保留通用 Guild/GuildMember 无法表达的微信字段。 */
   async getGroupSnapshot(guildId: string, force = false): Promise<RoomMembersResult> {
@@ -99,9 +136,129 @@ export class WebridgeInternal extends WebridgeNativeApi {
     await this.bot.query<Record<string, unknown>>(CMD_QUIT_GROUP, { id: guildId })
   }
 
-  /** 邀请某人入群（协议命令 `invite_group_member`）。 */
-  async inviteGuildMember(guildId: string, userId: string): Promise<void> {
-    await this.bot.query<Record<string, unknown>>(CMD_INVITE_GROUP_MEMBER, { room_id: guildId, wxid: userId })
+  // ------------------------------------------------------------------
+  // 群操作（协议 v8.0.80 第 16 节）
+  // ------------------------------------------------------------------
+
+  /**
+   * 规范化群成员 ID 列表：接受单个字符串或数组，逐项 trim，
+   * 拒绝非字符串、空串和内部含空白的值，按首次出现顺序去重。
+   *
+   * 为什么本地还要校验：协议要求成员 ID 去掉首尾空白、内部不能含空白，
+   * 设备对不合规参数只会回一个业务失败，在本地挡住能让调用方立刻看出是参数问题。
+   * 设备侧仍会再去重、按 ID 排序并自动排除本人；创建群时「至少 2 位其他好友」
+   * 是本接口首版的支持范围，由设备校验，这里不猜人数下限。
+   */
+  private groupMemberIds(values: string | string[]): string[] {
+    const list = Array.isArray(values) ? values : [values]
+    const result: string[] = []
+    for (const raw of list) {
+      if (typeof raw !== 'string') {
+        throw new Error(`群成员 ID 必须是字符串，收到 ${JSON.stringify(raw)}`)
+      }
+      const id = raw.trim()
+      if (!id) throw new Error('群成员 ID 不能为空字符串')
+      if (/\s/.test(id)) throw new Error(`群成员 ID 内部不能含空白：${JSON.stringify(raw)}`)
+      if (!result.includes(id)) result.push(id)
+    }
+    if (!result.length) throw new Error('至少需要一个群成员 ID')
+    return result
+  }
+
+  /** 校验群 ID：去掉首尾空白后非空，且内部不含空白（协议第 16 节的参数要求）。 */
+  private roomIdArg(roomId: string): string {
+    const id = String(roomId ?? '').trim()
+    if (!id) throw new Error(`群 ID 不能为空，收到 ${JSON.stringify(roomId)}`)
+    if (/\s/.test(id)) throw new Error(`群 ID 内部不能含空白：${JSON.stringify(roomId)}`)
+    return id
+  }
+
+  /**
+   * 创建普通群聊（协议命令 `create_group`，协议 v8.0.80 第 16 节）。
+   *
+   * 返回值是**合并后的业务结果**，业务失败不抛错：只有 `ok=true` 且
+   * `status='created'` 才确认建成群；部分成员失败时**不要再次建群**，
+   * 应读取 `member_results` 与 `invite_required_member_ids` 分别处理。
+   * 成员去重、排序、排除本人以及「至少 2 位其他好友」的校验都由设备完成。
+   *
+   * `options.requestId` 是**命令信封**的 request_id（协议要求必填，不传则随机生成）。
+   * 同 ID 只用于查询／重放原业务；**换 ID 不等于安全重试**。结果未知
+   * （`processing` / `unknown`）时用相同参数、相同 ID 读取迟到结果，
+   * 必要时再核实真实群状态。
+   */
+  async createGroup(memberIds: string | string[], options: { requestId?: string } = {}): Promise<GroupOperationOutcome> {
+    const members = this.groupMemberIds(memberIds)
+    return this.outcome<GroupOperationOutcome>(
+      CMD_CREATE_GROUP,
+      { member_ids: members },
+      GROUP_OPERATION_TIMEOUT,
+      options?.requestId,
+    )
+  }
+
+  /**
+   * 尝试**直接添加**群成员（协议命令 `add_group_member`，协议 v8.0.80 第 16 节）。
+   *
+   * 是否可直接加入由微信服务端和群设置决定，插件**不会**把添加失败自动转成发送邀请；
+   * `ok=true` 只表示目标均已加入或本来就在群。各状态的处理：
+   * - `requires_invitation`：只对 `invite_required_member_ids` 里的成员显式调用
+   *   `inviteGroupMembers`，并使用新的业务 ID，不要换 ID 重发本命令；
+   * - `requires_verification` / `approval_pending`：先补好友关系或等群主／管理员确认；
+   * - `partial`：逐人看 `member_results`，含 `unknown` 时保留同群占用，不自动重发整批；
+   * - `processing` / `unknown`：用相同参数、相同 ID 读取迟到结果，不自动重发。
+   *
+   * `options.requestId` 传入命令信封；同 ID 只用于查询／重放，换 ID 不等于安全重试。
+   */
+  async addGroupMember(
+    roomId: string,
+    memberIds: string | string[],
+    options: { reason?: string; requestId?: string } = {},
+  ): Promise<GroupOperationOutcome> {
+    const room = this.roomIdArg(roomId)
+    const members = this.groupMemberIds(memberIds)
+    // 协议允许 `member_id` / `member_ids` 二选一，这里统一传数组形态。
+    const args: Record<string, unknown> = { room_id: room, member_ids: members }
+    // `reason` 选填（入群申请说明），没传就不下发。
+    if (options?.reason) args.reason = String(options.reason)
+    return this.outcome<GroupOperationOutcome>(
+      CMD_ADD_GROUP_MEMBER,
+      args,
+      GROUP_OPERATION_TIMEOUT,
+      options?.requestId,
+    )
+  }
+
+  /**
+   * 发送入群邀请（协议命令 `invite_group_member`，协议 v8.0.80 第 16 节）。
+   *
+   * `ok=true` / `status='invitation_sent'` 仅确认本批邀请**已发出**，
+   * 对方接受后才入群；`already_in_room` 表示目标本来全在群，没有新请求。
+   * `processing` / `unknown` 时用相同参数、相同 ID 读取迟到结果，
+   * 换 request_id 不等于安全重试。
+   */
+  async inviteGroupMembers(
+    roomId: string,
+    memberIds: string | string[],
+    options: { requestId?: string } = {},
+  ): Promise<GroupOperationOutcome> {
+    const room = this.roomIdArg(roomId)
+    const members = this.groupMemberIds(memberIds)
+    return this.outcome<GroupOperationOutcome>(
+      CMD_INVITE_GROUP_MEMBER,
+      { room_id: room, member_ids: members },
+      GROUP_OPERATION_TIMEOUT,
+      options?.requestId,
+    )
+  }
+
+  /**
+   * 邀请某人入群（保留旧签名，内部委托 `inviteGroupMembers`）。
+   *
+   * 返回类型放宽为 `GroupOperationOutcome`：邀请成功只代表发送成功，
+   * 必须看业务 `status`，不能据此认为对方已入群。
+   */
+  async inviteGuildMember(guildId: string, userId: string): Promise<GroupOperationOutcome> {
+    return this.inviteGroupMembers(guildId, userId)
   }
 
   /**
@@ -114,14 +271,8 @@ export class WebridgeInternal extends WebridgeNativeApi {
     return this.bot.query<GroupNoticeResult>(CMD_GET_GROUP_NOTICE, { room_id: guildId })
   }
 
-  /**
-   * 把会话标记为已读（协议命令 `mark_session_read`）。
-   *
-   * `identifier` 可以是单个会话 ID、ID 数组，或 `'all'`（大小写不敏感，表示全部）。
-   */
-  async markSessionRead(identifier: string | string[]): Promise<void> {
-    await this.bot.query<Record<string, unknown>>(CMD_MARK_SESSION_READ, { identifier })
-  }
+  // 注：`mark_session_read`（把会话标记为已读）已在协议 v8.0.80 移除，
+  // 下发只会得到 `unsupported command_name`，且没有替代入口，因此不再提供。
 
   /**
    * 手机端 WeBridge 设置里要填的完整 WebSocket 地址。
@@ -196,7 +347,7 @@ export class WebridgeInternal extends WebridgeNativeApi {
   }
 
   // ------------------------------------------------------------------
-  // 红包与转账（协议 14.2 / 15.4 / 15.5）
+  // 红包与转账（协议 v8.0.80 14.6 / 15.4 / 15.5）
   // ------------------------------------------------------------------
 
   /** 领取红包。`red_packet_id` 就是事件里的同名字段，也是去重键。 */
@@ -214,28 +365,93 @@ export class WebridgeInternal extends WebridgeNativeApi {
   }
 
   /**
-   * 确认收款。
+   * 校验单个转账编号：允许省略；给了就必须是非空字符串（去首尾空白后非空）。
    *
-   * ⚠️ 成功判据（协议 14.2）：`ok == true` **且** `result.status == "confirm_invoked"`。
-   * 本方法把这条判断做掉，失败直接抛 —— 调用方不需要自己记住这个约定。
-   * **不要**拿 `callback_received == true` 当判据，协议明确否定了它。
+   * 协议 v8.0.80 14.6 明确「不得传数字、null、数组或对象」，所以非字符串一律拒绝。
    */
-  async receiveTransfer(transferId: string, messageId: string): Promise<Record<string, unknown>> {
-    const transfer = String(transferId ?? '').trim()
-    const message = String(messageId ?? '').trim()
-    if (!transfer || !message) {
-      throw new Error('receive_transfer 需要 transfer_id 与 message_id')
+  private transferIdArg(name: 'transfer_id' | 'message_id', value?: string): string {
+    if (value === undefined || value === null) return ''
+    if (typeof value !== 'string') throw new Error(`${name} 必须是字符串，收到 ${JSON.stringify(value)}`)
+    // 协议 v8.0.80 14.6 的原文是「去除首尾空白后两个字段都为空时失败」：
+    // 单个字段传空串等价于没提供，是否合法由 transferArgs() 汇总判断。
+    return value.trim()
+  }
+
+  /**
+   * 规范化转账定位参数：`transfer_id` / `message_id` 都可省略，但至少一项非空。
+   *
+   * 协议 v8.0.80 14.6：两个字段都按字符串原样保存、去掉首尾空白；可以省略未提供的字段；
+   * 两个都给时必须指向同一笔转账，否则设备返回 `ID_MISMATCH`（本地无法校验，交给设备）。
+   * 返回对象只包含**非空**字段，不让空串混进 args。
+   */
+  private transferArgs(transferId?: string, messageId?: string): Record<string, unknown> {
+    const transfer = this.transferIdArg('transfer_id', transferId)
+    const message = this.transferIdArg('message_id', messageId)
+    if (!transfer && !message) {
+      throw new Error('转账操作需要 transfer_id 或 message_id（至少一项非空）')
     }
-    const result = await this.bot.query<Record<string, unknown>>(CMD_RECEIVE_TRANSFER, {
-      transfer_id: transfer,
-      message_id: message,
-    })
-    if (String(result?.status ?? '') !== 'confirm_invoked') {
-      throw new Error(
-        `receive_transfer 未确认收款（status=${JSON.stringify(result?.status ?? null)}，期望 "confirm_invoked"）`,
-      )
-    }
-    return result
+    const args: Record<string, unknown> = {}
+    if (transfer) args.transfer_id = transfer
+    if (message) args.message_id = message
+    return args
+  }
+
+  /**
+   * 确认收款（协议命令 `receive_transfer`，协议 v8.0.80 14.6）。
+   *
+   * ⚠️ 成功判据**只有 `confirmed === true`** 一条（对应 `status='callback_ok'`，
+   * 或独立查询取得原生状态 2001）：
+   * - `status='confirm_invoked'` 表示「已发起收款、短等待超时」，此时 `confirmed=false`，
+   *   **不能认定到账**，也不能当失败；`accepted` 只表示进入业务流程，
+   *   `callback_received` 只是辅助信号；
+   * - 结果未知（`callback_unknown`、等待超时、`confirm_invoked`）时，先调用
+   *   `getTransferStatus` 查询资金状态（原生状态 2001 才确认已收取），
+   *   **不要直接重试**，也不要换 request_id 重发。
+   *
+   * 本方法不因业务失败抛错：返回信封 `ok`／`error` 与 `result` 合并后的结果，
+   * 失败时同样带 `status` / `confirmed` / `ret_code` 等诊断字段。
+   */
+  async receiveTransfer(transferId?: string, messageId?: string): Promise<TransferOutcome> {
+    return this.outcome<TransferOutcome>(
+      CMD_RECEIVE_TRANSFER,
+      this.transferArgs(transferId, messageId),
+      TRANSFER_OPERATION_TIMEOUT,
+    )
+  }
+
+  /**
+   * 退还待收取转账（协议命令 `refund_transfer`，协议 v8.0.80 14.6）。
+   *
+   * **只有 `status === 'refunded'` 且 `native_status === 2002` 才是已退还。**
+   * `ok=true`、`accepted=true`、命令传输成功都不能单独当退还成功判据。
+   * `refund_pending` 表示已提交但还没拿到终态（继续查询）、`refund_unknown` 表示
+   * 提交后异常或回包无法验证（不能直接认定失败）；这两者都**不能重提退还**，
+   * 必须先 `getTransferStatus` 查到终态。同一笔转账的收款与退还互斥，
+   * 未决操作会返回 `TRANSFER_BUSY`；退还被微信明确拒绝才解除本次提交的占用。
+   */
+  async refundTransfer(transferId?: string, messageId?: string): Promise<TransferOutcome> {
+    return this.outcome<TransferOutcome>(
+      CMD_REFUND_TRANSFER,
+      this.transferArgs(transferId, messageId),
+      TRANSFER_OPERATION_TIMEOUT,
+    )
+  }
+
+  /**
+   * 只查询转账资金状态（协议命令 `get_transfer_status`，协议 v8.0.80 14.6）。
+   *
+   * 只读：不收款、不退还，也不受「有效发送状态」限制（仍需通道鉴权、插件启用等前置条件）。
+   * 判据：`status='received'` 且 `native_status=2001` 表示已收取；
+   * `status='refunded'` 且 `native_status=2002` 表示已退还；`can_refund=true` 只表示
+   * 服务器状态是待收取、双方匹配且无同笔未决操作，**不包含有效发送状态**，
+   * 也不保证后续风控允许退还。每次查询使用新的外层 request_id。
+   */
+  async getTransferStatus(transferId?: string, messageId?: string): Promise<TransferOutcome> {
+    return this.outcome<TransferOutcome>(
+      CMD_GET_TRANSFER_STATUS,
+      this.transferArgs(transferId, messageId),
+      TRANSFER_OPERATION_TIMEOUT,
+    )
   }
 
   // ------------------------------------------------------------------

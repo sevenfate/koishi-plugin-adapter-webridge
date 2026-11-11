@@ -7,7 +7,7 @@
  * WebSocket 路由挂在 Koishi 自带的 server 服务上（`@koishijs/plugin-server`），
  * 不自开端口 —— 端口、TLS、反代都由 Koishi 那边统一管。
  *
- * 协议来源：WeBridge 插件作者提供的《服务端 WebSocket 协议说明》（v0.8.79）。
+ * 协议来源：WeBridge 插件作者提供的《服务端 WebSocket 协议说明》（v8.0.80）。
  */
 
 import { randomUUID } from 'node:crypto'
@@ -59,6 +59,7 @@ import {
   FRAME_HELLO,
   FRAME_PONG,
   SERVER_VERSION,
+  UNDECLARED_COMMANDS,
   buildCommand,
   buildHelloAck,
   createTimeToSeconds,
@@ -356,11 +357,14 @@ export class WebridgeBot<
   /**
    * 设备在 `hello` 里自报的支持命令清单。
    *
-   * 协议 13 明确要求：**不要硬编码这份清单**，以每次 `hello` 实际收到的为准 ——
-   * 它随插件版本变化（0.8.76 及更早版本的清单就有缺口，能执行但不在清单里）。
+   * 协议 v8.0.80 第 13 节明确要求：**不要硬编码这份清单**，以每次 `hello` 实际
+   * 收到的为准 —— 它随插件版本变化，而且**清单缺省不等于不支持**：
+   * 文档第 13 节点名列出的 `favorites_list` / `favorites_send` / `favorites_delete` /
+   * `set_friend_star` / `set_friend_blacklist` 及若干兼容别名可以执行却不在清单里
+   * （见 `UNDECLARED_COMMANDS`）；更早版本（0.8.76 及以前）的清单也缺过命令。
    *
-   * `supportsCommand()` 在清单为空时允许尝试；清单非空时按实际声明判断。
-   * 发送入口不会据此硬性过滤，老版本设备可能存在清单缺口。
+   * `supportsCommand()` 在清单为空时允许尝试；清单非空时按实际声明判断，
+   * 但对上述已知缺口放行。发送入口不会据此硬性过滤。
    */
   capabilities: string[] = []
 
@@ -832,9 +836,9 @@ export class WebridgeBot<
     // 它们不走消息会话，硬塞进事件流反而会污染对话上下文。
     // 新鲜度对它们没意义 —— 记日志本来就是为了排查连通性。
     if (rawText === null && media.length === 0) {
-      // 协议 15.1「事件类型总表」里的七种事件，除 message 之外都要派发出去 ——
+      // 协议 v8.0.80 23.1「事件类型总表」里的九种事件，除 message 之外的都要派发出去 ——
       // 这些数据在微信侧都没有历史查询，错过就永久丢失。
-      // 顺序：群成员（satori 标准事件）→ 红包/转账/好友申请/系统消息（自定义事件）。
+      // 顺序：群成员（satori 标准事件）→ 红包/转账/转账退还结果/好友申请/系统消息（自定义事件）。
       if (this.dispatchGroupMember(frame)) return
       if (this.dispatchPlatformEvent(frame)) return
       // 兜底：协议清单里没有的 event_name。仍然不丢，原样透传。
@@ -1012,18 +1016,24 @@ export class WebridgeBot<
   /**
    * 派发「satori 没有标准结构，但协议有定义」的事件。
    *
-   * 覆盖协议 15.1 里剩下的四种：
+   * 覆盖协议 v8.0.80 23.1 里 satori 没有标准结构的那几种：
    *
    * | 协议事件 | 派发 |
    * |---|---|
    * | `friend_request` | satori 标准 `friend-request` + 自定义 `webridge/friend-request` |
    * | `red_packet_received` | 自定义 `webridge/red-packet` |
    * | `transfer_received` | 自定义 `webridge/transfer` |
+   * | `transfer_refund_result` | 自定义 `webridge/transfer-refund-result` |
+   * | `moments_result` | 自定义 `webridge/moments-result` |
    * | `message` + `msg_type=system` | 自定义 `webridge/system-message` |
    *
    * 为什么自定义事件也发：satori 里没有红包 / 转账 / 系统消息的对应结构，
    * 硬塞进标准事件会让监听方拿到一个形状对不上的 Session。让监听方按
    * `payload.body` 自己取字段，比猜一个「差不多」的标准事件诚实。
+   *
+   * `transfer_refund_result` 的 body **没有会话字段**（无 chat_id / room_id /
+   * sender_id），因此只按自定义事件原样透传，**不构造消息 Session** ——
+   * 它是一次操作的异步结果，不是聊天消息。
    *
    * @returns 是否已派发（false 表示这个帧不归这里管）
    */
@@ -1032,6 +1042,8 @@ export class WebridgeBot<
     const CHANNELS: Partial<Record<string, string>> = {
       'red-packet': 'webridge/red-packet',
       transfer: 'webridge/transfer',
+      // 转账退还结果：body 没有会话字段，只走自定义事件，不进消息流。
+      'transfer-refund': 'webridge/transfer-refund-result',
       'moments-result': 'webridge/moments-result',
       'friend-request': 'webridge/friend-request',
       'system-message': 'webridge/system-message',
@@ -1261,15 +1273,19 @@ export class WebridgeBot<
    * `supports(name, session)`（判断 bot 是否实现某个 satori 方法），
    * 同名会与基类签名冲突、编译不过。
    *
-   * 协议 13 的两条提醒都体现在这里：
+   * 协议 v8.0.80 第 13 节的两条提醒都体现在这里：
    * 1. 清单随版本变化，**以 hello 收到的为准**（本方法读的就是它）；
-   * 2. 0.8.76 及更早版本清单有缺口（命令能执行但不在清单里）——
-   *    所以**清单为空时一律返回 true**，不拿「不在清单里」当「不支持」的证据，
-   *    否则老设备会被整片挡掉。
+   * 2. **清单缺省不等于不支持**：文档第 13 节点名的 `favorites_list` /
+   *    `favorites_send` / `favorites_delete` / `set_friend_star` /
+   *    `set_friend_blacklist` 及若干兼容别名可以执行却未声明，见
+   *    `UNDECLARED_COMMANDS`；0.8.76 及更早版本清单同样有缺口。
+   *
+   * 所以**清单为空时一律返回 true**，不拿「不在清单里」当「不支持」的证据，
+   * 否则老设备会被整片挡掉；清单非空时按实际声明判断，但已知缺口仍然放行。
    */
   supportsCommand(command: string): boolean {
     if (!this.capabilities.length) return true
-    return this.capabilities.includes(command)
+    return this.capabilities.includes(command) || UNDECLARED_COMMANDS.has(command)
   }
 
   /**

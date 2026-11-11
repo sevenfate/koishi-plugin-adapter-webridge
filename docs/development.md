@@ -110,6 +110,35 @@ if (session.platform === 'webridge') {
 `setGuildName()` 改群名，`setGuildSelfNickname()` 改自己的群名片；公告来自设备本地缓存，未命中不能证明没有公告。
 完整方法和参数见 TypeScript 声明及 [internal.ts](../src/internal.ts)。
 
+### 群操作与转账（协议 v8.0.80）
+
+```ts
+const group = await bot.internal.createGroup(['wxid_a', 'wxid_b'])
+if (group.ok && group.status === 'created') {
+  // group.room_id 是微信返回的新群 ID
+}
+
+const added = await bot.internal.addGroupMember(roomId, ['wxid_a'])
+if (!added.ok && added.status === 'requires_invitation') {
+  // 只对 added.invite_required_member_ids 里的成员发邀请，并使用新的业务 ID
+  await bot.internal.inviteGroupMembers(roomId, added.invite_required_member_ids ?? [])
+}
+
+const transfer = await bot.internal.receiveTransfer(undefined, messageId)
+if (transfer.ok && transfer.confirmed) {
+  // 确认收款
+} else if (transfer.status === 'confirm_invoked') {
+  // 等待超时：先查资金状态，不要直接重试
+  const state = await bot.internal.getTransferStatus(undefined, messageId)
+}
+```
+
+`createGroup()` / `addGroupMember()` / `inviteGroupMembers()` 返回 `GroupOperationOutcome`，`receiveTransfer()` / `refundTransfer()` / `getTransferStatus()` 返回 `TransferOutcome`：都是**命令信封的 `ok`／`error` 与业务 `result` 合并**的对象，业务失败不抛异常，诊断字段不会丢。
+群操作按 `status` 判断：`created` / `added` / `invitation_sent` / `already_in_room` 是成功形态；`requires_invitation` / `requires_verification` / `approval_pending` / `partial` / `processing` / `unknown` 是失败或未决。部分成员失败时不要再次建群，逐人读 `member_results` 与 `invite_required_member_ids`。
+群操作必须在命令信封提供 `request_id`：默认随机生成，也可用 `{ requestId }` 指定。**结果未知时用相同参数、相同 ID 查询或重放；换 ID 不等于安全重试。**
+收款只有 `confirmed=true`（典型 `status='callback_ok'`）才算到账；`confirm_invoked` 的 `confirmed=false` 表示已发起但等待超时。退还必须 `status='refunded'` 且 `native_status=2002`；`refund_pending` / `refund_unknown` 不能重提退还，先查状态。
+`mark_session_read`（标记已读）已在协议 v8.0.80 移除，`internal.markSessionRead()` 不再存在，下发只会得到 `unsupported command_name`。
+
 `internal.call(command, args, options?)` 提供类型化命令，涵盖公众号、联系人设置、二维码、群邀请、收藏、定位、朋友圈和媒体等。参数使用 snake_case；ID 和游标保持字符串，避免大整数精度丢失。
 命令清单、参数及默认等待时间见 [native.ts](../src/native.ts)。
 
@@ -125,7 +154,7 @@ const state = await bot.internal.call('moments_operation', {
 
 超时和断线不一定意味着写操作未执行。`WebridgeCommandError` 提供 `code/result/requestId/frame`，`WebridgeTransportError` 提供传输错误码、请求 ID 和命令名；业务插件应区分失败和结果未知，不自动重发写操作。
 CDN 上传要求显式保存并传入 `options.requestId`，结果未知时按原任务 ID 查询或复用；操作会产生文件传输助手消息，普通文件票据不是公开下载 URL。
-领取红包、确认收款、删好友、群管理及发布内容均需业务插件显式调用，适配器不会自动执行。
+领取红包、确认收款、退还转账、删好友、群操作及发布内容均需业务插件显式调用，适配器不会自动执行。
 
 ## 事件
 
@@ -134,12 +163,14 @@ CDN 上传要求显式保存并传入 `options.requestId`，结果未知时按�
 | `guild-member-added` / `guild-member-removed` / `guild-member-updated` | 群成员变化 |
 | `friend-request` | 好友申请，使用 `session.messageId` 关联处理 |
 | `webridge/red-packet` / `webridge/transfer` | 红包与转账原始事件 |
+| `webridge/transfer-refund-result` | 转账退还结果（协议 v8.0.80 23.5），按完整 `event_id` 去重 |
 | `webridge/friend-request` / `webridge/system-message` | 好友申请与系统原始事件 |
 | `webridge/unknown-message` / `webridge/unknown-event` | 未知内容或事件 |
 | `webridge/moments-result` | 朋友圈异步结果 |
 
 自定义事件接收 `WebridgeEventPayload`，并非普通消息 Session，不应直接作为聊天指令处理。
 好友申请仅缓存当前进程内最近 200 条；缺少设备申请凭据时不能同意，不支持拒绝操作。
+`webridge/transfer-refund-result` 的 body 没有会话字段，属于一次操作的异步结果而非聊天消息；`event_id` 形如 `transfer_refund:<refund_result_id>`，同一笔转账的不同结果各有独立 ID，**不能按 `transfer_id` 去重**。事件本身不代表退还成功：只有 `body.status === 'refunded'` 且 `body.native_status === 2002` 才确认已退还；退还提交后也可能不产生事件，未收到事件时仍需主动调用 `getTransferStatus()`。
 归档服务与历史查询见 [通讯录与归档](../ARCHIVE.md)。
 
 ## 源码验证与打包

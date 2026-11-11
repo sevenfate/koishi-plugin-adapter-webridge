@@ -31,7 +31,11 @@ import {
   previewContent,
   quoteEventDetail,
   APP_MSG_TYPE_QUOTE,
+  EVENT_TRANSFER_REFUND_RESULT,
+  KNOWN_EVENTS,
   KNOWN_MSG_TYPES,
+  NON_MESSAGE_EVENTS,
+  UNDECLARED_COMMANDS,
   buildEventPayload,
   canAcceptFriendRequest,
   frameKind,
@@ -181,6 +185,26 @@ test('dedupKey 在 event_id 缺失时用组合键兜底', () => {
   })
   const key = dedupKey(frame)
   assert.ok(key.includes('message') && key.includes('1000000') && key.includes('m1'), key)
+})
+
+test('dedupKey 在 event_id 缺失时用 refund_result_id 兜底', () => {
+  // 协议 v8.0.80 23.5：退还结果事件的 event_id 由 refund_result_id 拼成，
+  // 拼不出 event_id 时只能用 body.refund_result_id 兜底，否则同一结果会被反复派发。
+  const frame = textEvent({
+    event_name: 'transfer_refund_result',
+    event_id: undefined,
+    body: { refund_result_id: 'refund_result_example' },
+  })
+  const key = dedupKey(frame)
+  assert.ok(key.includes('refund_result_example'), '兜底键应包含 refund_result_id：' + key)
+
+  // event_id 存在时整体使用它，兜底字段不参与
+  const withId = textEvent({
+    event_name: 'transfer_refund_result',
+    event_id: 'transfer_refund:refund_result_example',
+    body: { refund_result_id: 'refund_result_example' },
+  })
+  assert.equal(dedupKey(withId), 'transfer_refund:refund_result_example')
 })
 
 test('eventAgeSeconds', () => {
@@ -763,14 +787,14 @@ test('groupMemberProfile：昵称变更事件用 new_room_nick_name 覆盖 roomN
 })
 
 // ---------------------------------------------------------------------------
-// 协议 15.1 七种事件的分类与兜底
+// 协议 15.1 / 23.5 事件的分类与兜底
 // ---------------------------------------------------------------------------
 
 function ev(name: string, body: Record<string, unknown> = {}): any {
   return { type: 'event', event_name: name, event_id: 'e:1', captured_at_ms: 1, body }
 }
 
-test('frameKind：七种协议事件都能分类', () => {
+test('frameKind：协议事件都能分类（含转账退还结果）', () => {
   assert.equal(frameKind(ev('message', { msg_type: 'text' })), 'message')
   assert.equal(frameKind(ev('message', { msg_type: 'system' })), 'system-message')
   assert.equal(frameKind(ev('group_member_join')), 'group-member')
@@ -778,7 +802,15 @@ test('frameKind：七种协议事件都能分类', () => {
   assert.equal(frameKind(ev('group_member_nickname_change')), 'group-member')
   assert.equal(frameKind(ev('red_packet_received')), 'red-packet')
   assert.equal(frameKind(ev('transfer_received')), 'transfer')
+  // 协议 v8.0.80 23.5 新增：转账退还结果，body 无会话字段，只走自定义事件
+  assert.equal(frameKind(ev('transfer_refund_result', { status: 'refunded', native_status: 2002 })), 'transfer-refund')
   assert.equal(frameKind(ev('friend_request')), 'friend-request')
+})
+
+test('KNOWN_EVENTS / NON_MESSAGE_EVENTS：包含 transfer_refund_result', () => {
+  assert.equal(EVENT_TRANSFER_REFUND_RESULT, 'transfer_refund_result')
+  assert.ok(KNOWN_EVENTS.has(EVENT_TRANSFER_REFUND_RESULT), '新事件应当被认作已知事件')
+  assert.ok(NON_MESSAGE_EVENTS.has(EVENT_TRANSFER_REFUND_RESULT), '新事件不是消息，不应进消息会话流')
 })
 
 test('frameKind：清单外的事件归 unknown，不能当消息处理', () => {
@@ -882,6 +914,11 @@ test('命令常量：与文档 14.2 的拼写逐字一致', () => {
     CMD_RECEIVE_RED_PACKET: 'receive_red_packet',
     CMD_RED_PACKET_DETAIL: 'red_packet_detail',
     CMD_RECEIVE_TRANSFER: 'receive_transfer',
+    // 协议 v8.0.80 新增：建群、直接加人、转账退还与状态查询
+    CMD_CREATE_GROUP: 'create_group',
+    CMD_ADD_GROUP_MEMBER: 'add_group_member',
+    CMD_REFUND_TRANSFER: 'refund_transfer',
+    CMD_GET_TRANSFER_STATUS: 'get_transfer_status',
     CMD_DELETE_SESSION: 'delete_session',
     CMD_SEND_PAT: 'send_pat',
     CMD_SEND_SIGNAL: 'send_signal',
@@ -902,6 +939,39 @@ test('命令常量：与文档 14.2 的拼写逐字一致', () => {
   }
   for (const [name, value] of Object.entries(expected)) {
     assert.equal((protocol as unknown as Record<string, unknown>)[name], value, name + ' 应与文档一致')
+  }
+
+  // 协议 v8.0.80 已移除 mark_session_read（下发只会得到 unsupported command_name），
+  // 适配器不再导出该常量，也不允许任何常量再用这个拼写。
+  assert.equal((protocol as unknown as Record<string, unknown>).CMD_MARK_SESSION_READ, undefined, '不应再导出已移除的常量')
+  assert.equal(
+    (Object.values(protocol) as unknown[]).includes('mark_session_read'),
+    false,
+    '协议 v8.0.80 已移除 mark_session_read，常量区不能再出现这个拼写',
+  )
+})
+
+test('UNDECLARED_COMMANDS：覆盖文档第 13 节点名的 13 项清单缺口', () => {
+  // 协议 v8.0.80 第 13 节：这些命令可执行却没进 capabilities，
+  // 只按清单过滤会误判；具体清单见 protocol.ts 的 UNDECLARED_COMMANDS 注释。
+  const expected = [
+    'favorites_list',
+    'favorites_send',
+    'favorites_delete',
+    'set_friend_star',
+    'set_friend_blacklist',
+    'group_invite_member',
+    'group_invite_member_probe',
+    'set_group_nickname',
+    'set_group_self_nickname',
+    'set_group_nickname_probe',
+    'set_group_self_nickname_probe',
+    'update_nickname',
+    'update_nickname_probe',
+  ]
+  assert.equal(UNDECLARED_COMMANDS.size, expected.length, '清单缺口条目数应与文档第 13 节一致')
+  for (const name of expected) {
+    assert.ok(UNDECLARED_COMMANDS.has(name), name + ' 应在清单缺口里')
   }
 })
 

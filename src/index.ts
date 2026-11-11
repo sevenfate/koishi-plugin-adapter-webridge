@@ -66,7 +66,7 @@ declare module '@satorijs/core' {
   /**
    * 自定义事件。
    *
-   * satori 的标准事件里没有红包 / 转账 / 系统消息的对应结构，而协议 15.1
+   * satori 的标准事件里没有红包 / 转账 / 系统消息的对应结构，而协议 v8.0.80 23.1
    * 明明定义了它们。硬塞进 `message-created` 之类的标准事件会让监听方拿到
    * 一个形状对不上的 Session，所以另开一组事件、原样透传协议字段。
    *
@@ -80,6 +80,19 @@ declare module '@satorijs/core' {
     'webridge/red-packet'(payload: WebridgeEventPayload): void
     /** 收转账（协议 15.5）。去重用 `body.transfer_id`，金额用 `body.amount_fen`。 */
     'webridge/transfer'(payload: WebridgeEventPayload): void
+    /**
+     * 转账退还结果（协议 v8.0.80 23.5 转账退还结果事件）。
+     *
+     * ⚠️ 去重必须用**完整 `event_id`**（形如 `transfer_refund:<refund_result_id>`），
+     * **不能按 `transfer_id` 去重** —— 同一笔转账的查询结果与后续结果各有独立的
+     * `refund_result_id`，按 transfer_id 去重会把后面的结果吞掉。
+     *
+     * ⚠️ 事件名**不代表退还成功**：只有 `body.status === 'refunded'` 且
+     * `body.native_status === 2002` 才确认已退还，`refund_pending` / `refund_unknown`
+     * 等都不是成功终态。退还提交后也可能不产生事件，**未收到事件也要主动查询**
+     * （`internal.getTransferStatus()`），不能只等这一条事件。
+     */
+    'webridge/transfer-refund-result'(payload: WebridgeEventPayload): void
     /** 好友申请（协议 15.7）。同意前必须校验 `encrypt_username` 与 `ticket`。 */
     'webridge/friend-request'(payload: WebridgeEventPayload): void
     /** 系统消息（`msg_type === 'system'`）：撤回、群名修改等。 */
